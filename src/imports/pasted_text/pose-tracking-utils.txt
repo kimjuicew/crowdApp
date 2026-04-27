@@ -1,0 +1,219 @@
+from ultralytics import YOLO
+import cv2
+import math
+import time
+import threading
+from collections import deque
+from supabase import create_client
+
+# ================== SUPABASE ==================
+url = "https://xqogrrdeepicusvryfud.supabase.co"
+key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhxb2dycmRlZXBpY3VzdnJ5ZnVkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU5NjYwNzIsImV4cCI6MjA5MTU0MjA3Mn0.2xl8graz0jfXG1pTsRQezQxfPmhgYAlhuTejdwGwHgw"
+supabase = create_client(url, key)
+
+def update_data(location, sit, stand, available):
+    try:
+        supabase.table("seat_status").upsert({
+            "location": location,
+            "sitting_count": sit,
+            "standing_count": stand,
+            "available_chairs": available
+        }).execute()
+        print(f"✅ [{location}] Sent: sit={sit}, stand={stand}, avail={available}")
+    except Exception as e:
+        print(f"❌ [{location}] Supabase error: {e}")
+
+# ================== FUNCTIONS ==================
+def angle(a, b, c):
+    ab = [a[0]-b[0], a[1]-b[1]]
+    cb = [c[0]-b[0], c[1]-b[1]]
+    dot = ab[0]*cb[0] + ab[1]*cb[1]
+    mag = math.sqrt(ab[0]**2 + ab[1]**2) * math.sqrt(cb[0]**2 + cb[1]**2)
+    if mag == 0:
+        return 180
+    cos_angle = max(-1.0, min(1.0, dot / mag))
+    return math.degrees(math.acos(cos_angle))
+
+def point_in_box(px, py, box, margin=20):
+    x1, y1, x2, y2 = box
+    return (x1 - margin) < px < (x2 + margin) and (y1 - margin) < py < (y2 + margin)
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter = max(0, xB-xA) * max(0, yB-yA)
+    areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    union = areaA + areaB - inter
+    return inter / union if union > 0 else 0
+
+# ================== WORKER PER VIDEO ==================
+def run_video(video_path, location, pose_model, detect_model, window_name):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ [{location}] Cannot open: {video_path}")
+        return
+
+    track_history = {}
+    MAX_HISTORY = 10
+    last_time = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        sitting_count = 0
+        standing_count = 0
+        occupied_chairs = set()
+
+        # ===== Detect chairs =====
+        det_results = detect_model(frame, verbose=False)
+        chairs = []
+        for box in det_results[0].boxes:
+            cls = int(box.cls[0])
+            name = detect_model.names[cls]
+            if name == "chair_detection":
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                chairs.append((x1, y1, x2, y2))
+
+        # ===== Pose + Tracking =====
+        pose_results = pose_model.track(frame, persist=True, conf=0.5, verbose=False)
+        frame = pose_results[0].plot()
+
+        # ===== วาด chair เริ่มต้น (available) =====
+        for idx, (x1, y1, x2, y2) in enumerate(chairs):
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+            cv2.putText(frame, "Chair: Available", (x1, y1-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
+
+        # ===== Process แต่ละคน =====
+        if pose_results[0].boxes.id is not None:
+            ids = pose_results[0].boxes.id.int().cpu().tolist()
+
+            for i, kpts in enumerate(pose_results[0].keypoints.xy):
+                person_id = ids[i]
+
+                hip   = kpts[11]
+                knee  = kpts[13]
+                ankle = kpts[15]
+
+                if hip[0] == 0 or knee[0] == 0 or ankle[0] == 0:
+                    hip   = kpts[12]
+                    knee  = kpts[14]
+                    ankle = kpts[16]
+
+                if hip[0] == 0 or knee[0] == 0 or ankle[0] == 0:
+                    continue
+
+                ang = angle(hip.tolist(), knee.tolist(), ankle.tolist())
+
+                if person_id not in track_history:
+                    track_history[person_id] = deque(maxlen=MAX_HISTORY)
+                track_history[person_id].append(ang)
+                avg_ang = sum(track_history[person_id]) / len(track_history[person_id])
+
+                if avg_ang < 100:
+                    posture = "SITTING"
+                elif avg_ang < 140:
+                    posture = "BENDING"
+                else:
+                    posture = "STANDING"
+
+                person_box = pose_results[0].boxes.xyxy[i].cpu().numpy()
+                hip_x, hip_y = int(hip[0]), int(hip[1])
+                on_chair = False
+                matched_chair_idx = -1
+
+                for idx, chair in enumerate(chairs):
+                    if point_in_box(hip_x, hip_y, chair, margin=30):
+                        on_chair = True
+                        matched_chair_idx = idx
+                        break
+                    if iou(person_box, chair) > 0.15:
+                        on_chair = True
+                        matched_chair_idx = idx
+                        break
+
+                if matched_chair_idx >= 0:
+                    occupied_chairs.add(matched_chair_idx)
+
+                if posture == "SITTING" and on_chair:
+                    status = "SITTING"
+                    color  = (0, 255, 0)
+                    sitting_count += 1
+                elif posture in ("SITTING", "BENDING"):
+                    status = "SITTING"
+                    color  = (0, 200, 100)
+                    sitting_count += 1
+                else:
+                    status = "STANDING"
+                    color  = (255, 100, 0)
+                    standing_count += 1
+
+                cv2.putText(frame, f"#{person_id} {status}", (hip_x - 20, hip_y - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+        # ===== วาด chair ที่ถูกนั่ง =====
+        for idx in occupied_chairs:
+            x1, y1, x2, y2 = chairs[idx]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame, "Chair: Occupied", (x1, y1-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+        available_chairs = len(chairs) - len(occupied_chairs)
+
+        # ===== Overlay =====
+        cv2.putText(frame, f"[{location}] Sitting:  {sitting_count}",   (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0),   2)
+        cv2.putText(frame, f"[{location}] Standing: {standing_count}",  (10, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 100, 0), 2)
+        cv2.putText(frame, f"[{location}] Available: {available_chairs}", (10, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        # ===== Send Supabase ทุก 30 วิ =====
+        if time.time() - last_time > 30:
+            update_data(location, sitting_count, standing_count, available_chairs)
+            last_time = time.time()
+
+        cv2.imshow(window_name, frame)
+        if cv2.waitKey(1) == 27:
+            break
+
+    cap.release()
+    cv2.destroyWindow(window_name)
+    print(f"✅ [{location}] Video ended.")
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    # โหลด model ก่อน (แยกกัน เพราะ YOLO track ใช้ state แยก)
+    pose_model_1 = YOLO("yolov8n-pose.pt")
+    detect_model_1 = YOLO(r"C:\Users\user\Desktop\introvertapp\best .pt")
+
+    pose_model_2 = YOLO("yolov8n-pose.pt")
+    detect_model_2 = YOLO(r"C:\Users\user\Desktop\introvertapp\best .pt")
+
+    t1 = threading.Thread(target=run_video, args=(
+        r"C:\Users\user\Desktop\introvertapp\vid1.mp4",
+        "zone1",
+        pose_model_1,
+        detect_model_1,
+        "Smart Seating - Zone 1"
+    ))
+
+    t2 = threading.Thread(target=run_video, args=(
+        r"C:\Users\user\Desktop\introvertapp\vid2.mp4",
+        "zone2",
+        pose_model_2,
+        detect_model_2,
+        "Smart Seating - Zone 2"
+    ))
+
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    print("✅ All done.")
